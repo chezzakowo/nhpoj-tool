@@ -66,7 +66,8 @@ Thật ra là có ai nước ngoài biết NHP::OJ đâu 🐧
 
 ## 📦 Cài đặt
 
-> Extension sẽ không bao có trên Chrome Web Store vì đây chỉ là dự án mình làm vì mình lười với mình không muốn tốn 5$ (~140k) cho 1 extension "khá vô dụng" đâu 💔 
+> Extension sẽ không bao có trên Chrome Web Store vì đây chỉ là dự án mình làm vì mình lười với mình không muốn tốn 5$ (~140k) cho 1 extension "khá vô dụng" đâu 💔 \
+
 ![](./docs/images/endmin_sleep.jpg)
 
 ### Yêu cầu
@@ -145,3 +146,4 @@ Cảm ơn tất cả mọi người đã đóng góp cho dự án! 💖
 Made with ❤️ by <a href="https://github.com/chezzakowo">Chez_ </a> & <a href="https://claude.ai">Claude </a>
 
 </div>
+

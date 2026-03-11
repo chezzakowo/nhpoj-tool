@@ -3,7 +3,7 @@
 # NHP::OJ Tools
 ![Perlica](./docs/images/icon128.png)
 
-![Version](https://img.shields.io/badge/version-0.3.6-blue?style=flat-square) ![Manifest](https://img.shields.io/badge/Manifest-v3-orange?style=flat-square) ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square) ![Platform](https://img.shields.io/badge/platform-Chromium-yellow?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.0-blue?style=flat-square) ![Manifest](https://img.shields.io/badge/Manifest-v3-orange?style=flat-square) ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square) ![Platform](https://img.shields.io/badge/platform-Chromium-yellow?style=flat-square)
 
 **"Bot" tự động Daily Sign-in cho [NHP::OJ](https://nhpoj.net)**
 Mở trình duyệt lên và nó sẽ tự động điểm danh hộ
@@ -146,4 +146,5 @@ Cảm ơn tất cả mọi người đã đóng góp cho dự án! 💖
 Made with ❤️ by <a href="https://github.com/chezzakowo">Chez_ </a> & <a href="https://claude.ai">Claude </a>
 
 </div>
+
 

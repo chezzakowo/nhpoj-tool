@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NHP::OJ Tools (Beta)",
-  "version": "0.3.6",
+  "version": "1.0",
   "description": "Bot tự động Daily Sign-in cho nhpoj.net. Một công cụ bởi Chez_",
   "icons": {
     "16": "icons/icon16.png",

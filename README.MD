@@ -82,7 +82,7 @@ Thật ra là có ai nước ngoài biết NHP::OJ đâu 🐧
 git clone https://github.com/chezzakowo/DoMixiNhatRac.git
 ```
 
-hoặc tải file ZIP từ [Releases](https://github.com/chezzakowo/DoMixiNhatRac/releases) rồi giải nén.
+hoặc tải file ZIP từ [Releases](https://github.com/chezzakowo/nhpoj-tool.git) rồi giải nén.
 
 **2. Mở trang Extensions của Chrome**
 
@@ -146,5 +146,6 @@ Cảm ơn tất cả mọi người đã đóng góp cho dự án! 💖
 Made with ❤️ by <a href="https://github.com/chezzakowo">Chez_ </a> & <a href="https://claude.ai">Claude </a>
 
 </div>
+
 
 

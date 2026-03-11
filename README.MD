@@ -26,6 +26,7 @@ Mở trình duyệt lên và nó sẽ tự động điểm danh hộ
 
 ## 🖼️ Ảnh chụp màn hình
 Đây là khi mình test trên trình duyệt Brave (v1.87.192)
+
 ![](./docs/images/screenshots/pop-up.png) ![](./docs/images/screenshots/web.png)
 
 ---
@@ -142,4 +143,5 @@ Cảm ơn tất cả mọi người đã đóng góp cho dự án! 💖
 
 <div align="center">
 Made with ❤️ by <a href="https://github.com/chezzakowo">Chez_ </a> & <a href="https://claude.ai">Claude </a>
+
 </div>

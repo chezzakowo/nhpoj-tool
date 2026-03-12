@@ -1,73 +1,23 @@
-// NHPOJ Sign-in Manager — Background v21
-// ── Fixes ────────────────────────────────────────────────────────────────────
-// [BG-1]  callSigninApi: await log() dời vào trong try-catch
-// [BG-2]  cookie onChanged: debounce 1500ms + chỉ filter session cookies
-// [BG-3]  POLL_MINUTES: 0.5 → 5 (Chrome min=1min, 0.5 gây 1440 call/ngày)
-// [BG-4]  schedulePollAlarm: async + await clear trước khi create (tránh duplicate)
-// [BG-5]  doAutoSignin: dùng UserCache thay vì double-fetchProfile
-// [BG-6]  parseSigninResponse: check r.data.error TRƯỚC khi extract d
-// [BG-7]  sighinstatus: handle cả boolean true lẫn string "true"
-// [BG-8]  UPDATE_SETTINGS: whitelist field, không dùng Object.assign tự do
-// [BG-9]  Thêm case 'DETECT_SESSION' vào handleMsg
-// [BG-10] Startup: tránh double refresh() khi service worker wake
-// [BG-11] CRITICAL: setTimeout → chrome.alarms cho random delay (SW có thể bị kill)
-// [BG-12] checkLogin() ra ngoài retry loop, chỉ check 1 lần trước POST loop
-// [BG-13] MAX_RETRY: 5 → 120 (retry 2 tiếng)
-// [BG-14] ALARM_SIGNIN_RUN alarm mới cho delayed execution, không dùng setTimeout
-// [BG-15] Thêm ALARM_SIGNIN_RETRY để retry loop survive SW termination
-// [BG-16] Dùng last_sighin_time so sánh ngày LOCAL (không UTC) để xác định đã điểm danh
-// [BG-17] Deadline chuỗi 07:00 — DEPRECATED (xem BG-21)
-// [BG-18] Auto-trigger khi startup/poll: chưa điểm danh → tự gửi ngay
-// [BG-19] Rewrite auto flow: dùng sighinstatus==="false" (string) thay vì last_sighin_time
-//         checkSigninStatus() trực tiếp từ GET /api/signin, sendSignInPost() → bool
-//         Bỏ checkLogin()/fetchProfile trong auto flow — /api/signin đủ data
-//         Fix stray } thừa cuối checkAndAutoSignInIfNeeded
-// [BG-20] FIX: isBeforeChainDeadline() chỉ gate retry loop
-//         checkAndAutoSignInIfNeeded() KHÔNG còn bị chặn bởi 7h → chạy bất kể giờ nào
-//         Bỏ deadline gate đầu runAutoSignIn() — chỉ giữ trong retry loop
-//         CHECK_STATUS handler: nếu sighinstatus="false" + autoSignin → tự fire sign-in ngầm
-// [BG-21] FIX LOGIC NGÀY THEO SERVER (+08:00, MỐC 07:00):
-//         Server dùng 07:00 +08:00 làm mốc bắt đầu ngày mới (không phải 00:00)
-//         getEffectiveDateStr(): nếu giờ hiện tại ở +08:00 < 07:00 → effectiveDate = hôm qua
-//         isSignedInToday(): so sánh last_sighin_time với effectiveDate (không phải local date)
-//         Bỏ hoàn toàn logic chặn POST sau 7h trong retry loop — server là source of truth
-//         sighinstatus="true" → đã điểm danh; "false" → chưa → POST ngay
-//         data=null → lỗi mạng/hết phiên → không POST
-//         Thêm check profile trước khi POST (theo đặc tả)
-// ─────────────────────────────────────────────────────────────────────────────
-
 'use strict';
 
 const NHPOJ_BASE   = 'https://nhpoj.net';
 const PROFILE_API  = `${NHPOJ_BASE}/api/profile`;
 const SIGHIN_API   = `${NHPOJ_BASE}/api/sighin`;
-const ALARM_SIGNIN     = 'nhpoj_signin';      // alarm đặt giờ hàng ngày
-const ALARM_SIGNIN_RUN = 'nhpoj_signin_run';  // [BG-11/14] alarm thực thi sau random delay
+const ALARM_SIGNIN     = 'nhpoj_signin';
+const ALARM_SIGNIN_RUN = 'nhpoj_signin_run';
 const ALARM_POLL       = 'nhpoj_poll';
-
-// [BG-3] FIX: Chrome Alarm tối thiểu 1 phút. 0.5 bị clamp thành 1 phút
-// = 1440 network call/ngày → rate-limit + battery drain. 5 phút là hợp lý.
-const POLL_MINUTES = 5;
+const POLL_MINUTES     = 5;
+const SERVER_UTC_OFFSET      = 8;
+const SERVER_DAY_START_HOUR  = 7;
+const MAX_RETRY              = 120;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// [BG-21] Timezone & ngày hiệu lực theo quy tắc server
-//
-// Server timezone: +08:00 (Asia/Shanghai / Asia/Taipei)
-// Mốc ngày mới của server: 07:00 +08:00 (KHÔNG phải 00:00)
-//
-// Ví dụ:
-//   Người dùng ở +07:00, lúc 06:30 sáng ngày 23/02:
-//     → Giờ server (+08:00) = 07:30 → đã qua mốc 7h → effectiveDate = "2026-02-23"
-//   Người dùng ở +07:00, lúc 05:30 sáng ngày 23/02:
-//     → Giờ server (+08:00) = 06:30 → chưa qua mốc 7h → effectiveDate = "2026-02-22" (hôm qua)
+// Timezone & Effective Date
 // ─────────────────────────────────────────────────────────────────────────────
-
-const SERVER_UTC_OFFSET = 8;    // +08:00
-const SERVER_DAY_START_HOUR = 7; // 07:00
 
 /**
- * Trả về giờ hiện tại theo server timezone (+08:00) dưới dạng Date object
- * với giờ/phút/giây đã được điều chỉnh về UTC+8.
+ * Trả về thời điểm hiện tại được quy đổi sang múi giờ server (+08:00).
+ * @returns {Date} Đối tượng Date với giờ/phút/giây tương ứng UTC+8.
  */
 function nowInServerTz() {
   const nowUtcMs = Date.now() + new Date().getTimezoneOffset() * 60_000;
@@ -75,21 +25,15 @@ function nowInServerTz() {
 }
 
 /**
- * [BG-21] Trả về "ngày hiệu lực" theo quy tắc server: YYYY-MM-DD
- *
- * Nếu giờ server hiện tại < 07:00 → trả về ngày HÔM QUA (ngày mới chưa bắt đầu)
- * Nếu giờ server hiện tại >= 07:00 → trả về ngày HÔM NAY
- *
- * Dùng để so sánh với last_sighin_time từ API.
+ * Trả về "ngày hiệu lực" theo quy tắc server: mốc bắt đầu ngày là 07:00 +08:00.
+ * Nếu giờ server hiện tại < 07:00, ngày hiệu lực là ngày hôm qua.
+ * @returns {string} Chuỗi định dạng "YYYY-MM-DD".
  */
 function getEffectiveDateStr() {
   const serverNow = nowInServerTz();
-  const hour = serverNow.getHours();
-  if (hour < SERVER_DAY_START_HOUR) {
-    // Chưa qua 07:00 → lùi lại 1 ngày
+  if (serverNow.getHours() < SERVER_DAY_START_HOUR) {
     serverNow.setDate(serverNow.getDate() - 1);
   }
-  // Format YYYY-MM-DD
   const y  = serverNow.getFullYear();
   const mo = String(serverNow.getMonth() + 1).padStart(2, '0');
   const d  = String(serverNow.getDate()).padStart(2, '0');
@@ -97,23 +41,34 @@ function getEffectiveDateStr() {
 }
 
 /**
- * [BG-21] Kiểm tra xem last_sighin_time có phải là "hôm nay" theo ngày hiệu lực không.
- * @param {string|null} lastSigninTime - "YYYY-MM-DD" từ server
- * @returns {boolean}
+ * Kiểm tra xem thời điểm điểm danh gần nhất có thuộc ngày hiệu lực hiện tại không.
+ * @param {string|null} lastSigninTime - Chuỗi "YYYY-MM-DD" trả về từ server.
+ * @returns {boolean} `true` nếu đã điểm danh trong ngày hiệu lực.
  */
 function isSignedInToday(lastSigninTime) {
   if (!lastSigninTime) return false;
   return lastSigninTime >= getEffectiveDateStr();
 }
 
-// [BG-21] Kept for backward compat — không còn dùng trong logic chính
+/**
+ * Alias tương thích ngược — trả về ngày hiệu lực theo server.
+ * @returns {string} Chuỗi định dạng "YYYY-MM-DD".
+ */
 function getLocalDateStr() {
   return getEffectiveDateStr();
 }
 
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Logger
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Ghi log vào console và lưu vào `chrome.storage.local` (tối đa 300 bản ghi).
+ * @param {'DEBUG'|'INFO'|'OK'|'WARN'|'ERROR'} level - Mức độ log.
+ * @param {string} cat   - Danh mục / module phát sinh log.
+ * @param {string} msg   - Nội dung thông điệp.
+ * @param {*}      [data] - Dữ liệu bổ sung tuỳ chọn (sẽ được JSON.stringify).
+ */
 async function log(level, cat, msg, data = null) {
   const line = `[NHPOJ][${cat}] ${msg}`;
   if (level === 'ERROR' || level === 'WARN') console.warn(line, data ?? '');
@@ -130,9 +85,15 @@ async function log(level, cat, msg, data = null) {
   } catch (_) {}
 }
 
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Rank
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Trả về danh hiệu tương ứng với điểm kinh nghiệm của người dùng.
+ * @param {number|string} exp - Điểm kinh nghiệm.
+ * @returns {string|null} Danh hiệu, hoặc `null` nếu giá trị không hợp lệ.
+ */
 function getRankFromExp(exp) {
   const n = Number(exp);
   if (isNaN(n) || n < 0)  return null;
@@ -146,9 +107,14 @@ function getRankFromExp(exp) {
   return 'Legend';
 }
 
-// ───────────────────────────────────────────────────────────────
-// CSRF token
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// CSRF Token
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Lấy giá trị CSRF token từ cookie của trang NHPOJ.
+ * @returns {Promise<string|null>} Giá trị token, hoặc `null` nếu không tìm thấy.
+ */
 async function getCsrfToken() {
   try {
     const cookie = await chrome.cookies.get({ url: NHPOJ_BASE, name: 'csrftoken' });
@@ -158,9 +124,16 @@ async function getCsrfToken() {
   }
 }
 
-// ───────────────────────────────────────────────────────────────
-// Fetch /api/profile
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Profile API
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Gọi GET `/api/profile` để xác minh trạng thái đăng nhập và lấy thông tin người dùng.
+ * @returns {Promise<{loggedIn: boolean, raw: object|null, error?: string}>}
+ *   - `loggedIn`: `true` nếu server trả về data hợp lệ.
+ *   - `raw`: Dữ liệu thô từ server, hoặc `null` nếu chưa đăng nhập / lỗi.
+ */
 async function fetchProfile() {
   try {
     const csrf = await getCsrfToken();
@@ -186,6 +159,13 @@ async function fetchProfile() {
   }
 }
 
+/**
+ * Xây dựng đối tượng `account` từ dữ liệu profile thô và thông tin được lưu trước đó.
+ * Bảo toàn các trường tuỳ chỉnh (signinTime, autoSignin, lastSignin) nếu cùng user.
+ * @param {object|null} data - Dữ liệu profile thô từ server.
+ * @param {object|null} prev - Dữ liệu account đang lưu trong storage.
+ * @returns {object|null} Đối tượng account chuẩn hoá, hoặc `null` nếu `data` rỗng.
+ */
 function buildAccountFromProfile(data, prev) {
   if (!data) return null;
   const isSameUser = prev && prev.userId && prev.userId === data.user?.id;
@@ -209,25 +189,56 @@ function buildAccountFromProfile(data, prev) {
   };
 }
 
-// ───────────────────────────────────────────────────────────────
-// Cache
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// UserCache
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Bộ nhớ đệm trong bộ nhớ cho thông tin tài khoản và trạng thái xác thực.
+ * Giảm số lần gọi storage/network khi nhiều thành phần cùng truy vấn.
+ */
 const UserCache = {
   _account: null, _cachedAt: 0, _authState: 'UNKNOWN',
+
+  /** Lưu tài khoản vào cache và đánh dấu trạng thái LOGGED_IN. */
   setLoggedIn(a)  { this._account = {...a}; this._cachedAt = Date.now(); this._authState = 'LOGGED_IN'; },
+
+  /** Xoá cache tài khoản và đánh dấu trạng thái LOGGED_OUT. */
   setLoggedOut()  { this._account = null;   this._cachedAt = Date.now(); this._authState = 'LOGGED_OUT'; },
+
+  /** Xoá toàn bộ cache, đặt lại trạng thái về UNKNOWN. */
   clear()         { this._account = null;   this._cachedAt = 0;          this._authState = 'UNKNOWN'; },
+
+  /** Trả về đối tượng account đang được cache, hoặc `null`. */
   get()           { return this._account; },
+
+  /** Trả về chuỗi trạng thái xác thực hiện tại: 'UNKNOWN' | 'LOGGED_IN' | 'LOGGED_OUT'. */
   authState()     { return this._authState; },
+
+  /**
+   * Kiểm tra cache có cũ quá ngưỡng cho phép không.
+   * @param {number} [ms=60000] - Ngưỡng thời gian tính bằng mili-giây.
+   * @returns {boolean} `true` nếu cache đã cũ.
+   */
   isStale(ms = 60_000) { return (Date.now() - this._cachedAt) > ms; },
 };
 
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // AuthManager
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Quản lý vòng đời xác thực: làm mới thông tin người dùng, đồng bộ storage,
+ * cập nhật cache và phát sự kiện thay đổi trạng thái đến các thành phần khác.
+ */
 const AuthManager = {
   _busy: false,
 
+  /**
+   * Làm mới trạng thái xác thực bằng cách gọi `/api/profile`.
+   * Tự động cập nhật storage, cache và lên lịch alarm điểm danh nếu cần.
+   * Có cơ chế chống gọi đồng thời (chỉ chạy một lần tại một thời điểm).
+   */
   async refresh() {
     if (this._busy) return;
     this._busy = true;
@@ -264,10 +275,18 @@ const AuthManager = {
     }
   },
 
+  /**
+   * Phát sự kiện `AUTH_CHANGED` đến tất cả các listener (popup, content script).
+   * @param {object} payload - Dữ liệu đính kèm sự kiện.
+   */
   _broadcast(payload) {
     chrome.runtime.sendMessage({ action: 'AUTH_CHANGED', payload }).catch(() => {});
   },
 
+  /**
+   * Tải trạng thái tài khoản từ `chrome.storage.local` vào bộ nhớ đệm.
+   * Dùng khi service worker vừa thức dậy để tránh gọi network ngay lập tức.
+   */
   async warmFromStorage() {
     const { account } = await chrome.storage.local.get('account');
     if (account) UserCache.setLoggedIn(account);
@@ -275,9 +294,10 @@ const AuthManager = {
   }
 };
 
-// ───────────────────────────────────────────────────────────────
-// Cookie tracker — [BG-2] FIX: debounce + filter session cookies
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Cookie Tracker
+// ─────────────────────────────────────────────────────────────────────────────
+
 const SESSION_COOKIES = new Set(['csrftoken', 'sessionid']);
 let _cookieDebounceTimer = null;
 
@@ -285,18 +305,24 @@ chrome.cookies.onChanged.addListener((changeInfo) => {
   if (!changeInfo.cookie.domain.includes('nhpoj.net')) return;
   if (!SESSION_COOKIES.has(changeInfo.cookie.name)) return;
   log('DEBUG', 'COOKIE', `"${changeInfo.cookie.name}" thay đổi (${changeInfo.cause})`);
-  // [BG-2] FIX: debounce 1500ms — tránh N refresh đồng thời khi login tạo nhiều cookie
   clearTimeout(_cookieDebounceTimer);
   _cookieDebounceTimer = setTimeout(() => AuthManager.refresh(), 1500);
 });
 
-// ───────────────────────────────────────────────────────────────
-// API sign-in — [BG-1] FIX: log() bên trong try
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Sign-in API
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Gọi API điểm danh `/api/sighin` với phương thức GET hoặc POST.
+ * @param {'GET'|'POST'} method - Phương thức HTTP cần dùng.
+ * @returns {Promise<{ok: boolean, status: number, data?: object, error?: string}>}
+ *   Kết quả phản hồi thô từ server, hoặc thông tin lỗi nếu request thất bại.
+ */
 async function callSigninApi(method) {
   const csrf = await getCsrfToken();
   try {
-    await log('INFO', 'SIGNIN', `${method} ${SIGHIN_API}`); // [BG-1] FIX: trong try
+    await log('INFO', 'SIGNIN', `${method} ${SIGHIN_API}`);
     const opts = {
       method, credentials: 'include',
       headers: {
@@ -320,13 +346,27 @@ async function callSigninApi(method) {
   }
 }
 
-// [BG-6]  FIX: check r.data.error TRƯỚC khi extract d
-// [BG-7]  FIX: sighinstatus có thể là boolean true hoặc string "true"
-// [BG-21] FIX: dùng isSignedInToday() + getEffectiveDateStr() thay vì so sánh với local date
-//         Logic:
-//           sighinstatus="true"  → đã điểm danh (server confirm)
-//           sighinstatus="false" + last_sighin_time >= effectiveDate → vẫn coi là đã điểm danh
-//           sighinstatus="false" + last_sighin_time < effectiveDate  → chưa điểm danh
+/**
+ * Phân tích phản hồi thô từ API điểm danh thành trạng thái có cấu trúc.
+ *
+ * Logic xác định đã điểm danh:
+ *  - `sighinstatus === true` hoặc `"true"` → đã điểm danh (server xác nhận).
+ *  - `sighinstatus === "false"` nhưng `last_sighin_time >= effectiveDate` → vẫn coi là đã điểm danh.
+ *  - `data === null` → lỗi mạng hoặc hết phiên → không POST.
+ *
+ * @param {object} r - Đối tượng phản hồi từ `callSigninApi`.
+ * @returns {{
+ *   status: 'ok'|'error'|'auth_error',
+ *   signed?: boolean,
+ *   alreadySignedIn?: boolean,
+ *   today?: boolean,
+ *   continueDays?: number|null,
+ *   lastSigninTime?: string|null,
+ *   effectiveDate?: string,
+ *   raw?: object,
+ *   error?: string
+ * }}
+ */
 function parseSigninResponse(r) {
   if (!r) return { status: 'error', error: 'Không có phản hồi' };
   if (r.error && !r.data) return { status: 'error', error: r.error };
@@ -335,69 +375,61 @@ function parseSigninResponse(r) {
       return { status: 'auth_error', error: `Phiên hết hạn (${r.status})` };
     return { status: 'error', error: r.error || `HTTP ${r.status}` };
   }
-  if (r.data?.error) return { status: 'error', error: String(r.data.error) }; // [BG-6] FIX
+  if (r.data?.error) return { status: 'error', error: String(r.data.error) };
 
-  // [BG-21] Trả về null nếu server không trả data (lỗi mạng / hết phiên)
   const d = r.data?.data;
   if (d === null || d === undefined) {
     return { status: 'error', error: 'Server trả data=null (lỗi mạng hoặc hết phiên)' };
   }
 
-  const effectiveDate = getEffectiveDateStr(); // [BG-21] ngày hiệu lực theo +08:00, mốc 7h
-  const lastTime      = d?.last_sighin_time ?? null;
-
-  // [BG-7] FIX: boolean true || string "true"
-  const signedByStatus = d?.sighinstatus === true || d?.sighinstatus === 'true';
-  // [BG-21] double-check: ngay cả khi server trả "false", nếu last_sighin_time >= effectiveDate
-  // thì vẫn coi là đã điểm danh trong ngày hiệu lực (tránh điểm danh trùng)
-  const signedByDate   = isSignedInToday(lastTime);
+  const effectiveDate   = getEffectiveDateStr();
+  const lastTime        = d?.last_sighin_time ?? null;
+  const signedByStatus  = d?.sighinstatus === true || d?.sighinstatus === 'true';
+  const signedByDate    = isSignedInToday(lastTime);
   const alreadySignedIn = signedByStatus || signedByDate;
 
   return {
     status: 'ok',
     signed:          signedByStatus,
     alreadySignedIn,
-    today:           alreadySignedIn,          // alias cho popup
+    today:           alreadySignedIn,
     continueDays:    d?.continue_sighin_days ?? null,
     lastSigninTime:  lastTime,
-    effectiveDate,                              // debug — ngày hiệu lực đang dùng
+    effectiveDate,
     raw: r.data
   };
 }
 
-// ───────────────────────────────────────────────────────────────
-// Auto sign-in v4 — [BG-19]
-// Dùng GET /api/signin + sighinstatus string ("true"/"false")
-// Không dùng /api/profile trong auto flow
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Auto Sign-in Core
+// ─────────────────────────────────────────────────────────────────────────────
 
-/** Trả về số phút ngẫu nhiên trong khoảng [1, 20] */
+/**
+ * Tạo số phút trễ ngẫu nhiên trong khoảng [1, 20] để tránh gửi request đồng thời.
+ * @returns {number} Số phút trễ.
+ */
 function getRandomDelayMin() {
   return Math.floor(Math.random() * 20) + 1;
 }
 
+/**
+ * Dừng thực thi trong một khoảng thời gian xác định.
+ * @param {number} ms - Thời gian chờ tính bằng mili-giây.
+ * @returns {Promise<void>}
+ */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
- * GET /api/signin → phân tích response theo logic [BG-21]
+ * Kiểm tra trạng thái điểm danh hiện tại bằng cách gọi GET `/api/sighin`.
  *
- * Trả về object:
- *   { needSignIn: true }   → chưa điểm danh trong ngày hiệu lực → cần POST
- *   { needSignIn: false }  → đã điểm danh → không cần làm gì
- *   null                   → lỗi mạng / data=null / chưa đăng nhập → không POST
+ * Trả về:
+ *  - `{ needSignIn: false, reason }` — đã điểm danh trong ngày hiệu lực, không cần POST.
+ *  - `{ needSignIn: true, lastTime, effectiveDate }` — chưa điểm danh, cần POST.
+ *  - `null` — lỗi mạng, `data=null`, hoặc chưa đăng nhập; không nên POST.
  *
- * Logic:
- *   1. data = null → lỗi → return null
- *   2. sighinstatus = "true" → đã điểm danh → return { needSignIn: false }
- *   3. sighinstatus = "false":
- *        + last_sighin_time >= effectiveDate → đã điểm danh trong ngày hiệu lực
- *          → return { needSignIn: false } (tránh POST trùng)
- *        + last_sighin_time < effectiveDate → chưa điểm danh
- *          → return { needSignIn: true }
- *
- * [BG-21] effectiveDate = ngày theo server +08:00 với mốc 07:00
+ * @returns {Promise<{needSignIn: boolean, reason?: string, lastTime?: string, effectiveDate?: string}|null>}
  */
 async function checkSigninStatus() {
   try {
@@ -430,14 +462,12 @@ async function checkSigninStatus() {
 
     await log('DEBUG', 'AUTO', 'checkSigninStatus raw JSON', json);
 
-    // Hỗ trợ nhiều cấu trúc nested khác nhau mà server có thể trả
     const inner =
-      json?.data?.data ??   // { error:null, data: { sighinstatus:... } }
-      json?.data       ??   // { sighinstatus:... }
-      json             ??   // { sighinstatus:... } (root)
+      json?.data?.data ??
+      json?.data       ??
+      json             ??
       null;
 
-    // [BG-21] data = null → lỗi mạng hoặc hết phiên → không POST
     if (inner === null || typeof inner !== 'object') {
       await log('WARN', 'AUTO', 'checkSigninStatus: data=null hoặc không phải object → lỗi mạng/hết phiên', { json });
       return null;
@@ -448,39 +478,34 @@ async function checkSigninStatus() {
       return null;
     }
 
-    const rawStatus   = inner.sighinstatus;
-    const statusStr   = String(rawStatus);
-    const lastTime    = inner.last_sighin_time ?? null;
-    const effectiveDate = getEffectiveDateStr(); // [BG-21]
+    const rawStatus     = inner.sighinstatus;
+    const statusStr     = String(rawStatus);
+    const lastTime      = inner.last_sighin_time ?? null;
+    const effectiveDate = getEffectiveDateStr();
 
     await log('DEBUG', 'AUTO',
       `checkSigninStatus → sighinstatus="${statusStr}" last="${lastTime}" ` +
       `effectiveDate="${effectiveDate}" days=${inner.continue_sighin_days}`
     );
 
-    // [BG-21] Case 1: server xác nhận đã điểm danh
     if (statusStr === 'true') {
       await log('OK', 'AUTO', 'sighinstatus="true" → đã điểm danh');
       return { needSignIn: false, reason: 'sighinstatus=true' };
     }
 
-    // [BG-21] Case 2: sighinstatus="false" → kiểm tra last_sighin_time vs effectiveDate
     if (statusStr === 'false') {
       if (isSignedInToday(lastTime)) {
-        // last_sighin_time >= effectiveDate → đã điểm danh trong ngày hiệu lực
         await log('OK', 'AUTO',
           `sighinstatus="false" nhưng last_sighin_time="${lastTime}" >= effectiveDate="${effectiveDate}" → đã điểm danh`
         );
         return { needSignIn: false, reason: 'lastSigninTime>=effectiveDate' };
       }
-      // last_sighin_time < effectiveDate → CHƯA điểm danh
       await log('INFO', 'AUTO',
         `sighinstatus="false" + last_sighin_time="${lastTime}" < effectiveDate="${effectiveDate}" → CẦN điểm danh`
       );
       return { needSignIn: true, lastTime, effectiveDate };
     }
 
-    // Trường hợp không xác định
     await log('WARN', 'AUTO', `checkSigninStatus: sighinstatus không xác định "${statusStr}"`, { inner });
     return null;
 
@@ -491,8 +516,8 @@ async function checkSigninStatus() {
 }
 
 /**
- * POST /api/signin → trả về boolean (true = thành công)
- * [BG-19] success = json.data.error === null
+ * Gửi POST `/api/sighin` để thực hiện điểm danh.
+ * @returns {Promise<boolean>} `true` nếu server xác nhận thành công (`data.error === null`).
  */
 async function sendSignInPost() {
   try {
@@ -519,7 +544,6 @@ async function sendSignInPost() {
     }
     const json = await resp.json();
     await log('DEBUG', 'AUTO', 'sendSignInPost response', json);
-    // success: data.error === null
     return json?.data?.error === null;
   } catch (e) {
     await log('ERROR', 'AUTO', 'sendSignInPost lỗi', e.message);
@@ -527,22 +551,14 @@ async function sendSignInPost() {
   }
 }
 
-// [BG-13] 120 lần × 1 phút = retry tối đa 2 tiếng
-const MAX_RETRY = 120;
-
 /**
- * [BG-21] Flow chính — chạy hoàn toàn ngầm, không cần popup:
+ * Luồng điểm danh tự động đầy đủ, chạy hoàn toàn ngầm.
  *
- *  Bước 1: GET /api/profile → xác minh đăng nhập
- *          data=null → chưa đăng nhập → dừng (không POST)
+ * Bước 1: GET `/api/profile` — xác minh đăng nhập. Nếu chưa đăng nhập, dừng.
+ * Bước 2: GET `/api/sighin` — kiểm tra trạng thái. Nếu đã điểm danh, thoát.
+ * Bước 3: POST loop — gửi điểm danh tối đa `MAX_RETRY` lần, cách nhau 1 phút.
  *
- *  Bước 2: GET /api/signin → checkSigninStatus()
- *          null            → lỗi mạng / data=null → không POST → báo lỗi
- *          needSignIn=false → đã điểm danh → thoát
- *          needSignIn=true  → chưa điểm danh → POST loop
- *
- *  POST loop tối đa MAX_RETRY lần, retry mỗi 1 phút.
- *  Không có deadline 7h — server là nguồn truth duy nhất.
+ * Server là nguồn dữ liệu duy nhất; không có deadline cứng về giờ phía client.
  */
 async function runAutoSignIn() {
   await log('INFO', 'AUTO', '━━━ runAutoSignIn bắt đầu ━━━');
@@ -554,7 +570,6 @@ async function runAutoSignIn() {
     return;
   }
 
-  // [BG-21] Bước 1: xác minh đăng nhập trước (theo đặc tả)
   await log('INFO', 'AUTO', 'Bước 1: xác minh đăng nhập qua /api/profile');
   const { loggedIn } = await fetchProfile();
   if (!loggedIn) {
@@ -563,7 +578,6 @@ async function runAutoSignIn() {
     return;
   }
 
-  // [BG-21] Bước 2: GET /api/signin để kiểm tra trạng thái
   await log('INFO', 'AUTO', 'Bước 2: kiểm tra trạng thái điểm danh');
   const statusResult = await checkSigninStatus();
 
@@ -578,7 +592,6 @@ async function runAutoSignIn() {
     return;
   }
 
-  // needSignIn=true → tiến hành POST loop
   await log('INFO', 'AUTO',
     `Chưa điểm danh (last="${statusResult.lastTime}", effectiveDate="${statusResult.effectiveDate}") → bắt đầu POST loop`
   );
@@ -605,23 +618,21 @@ async function runAutoSignIn() {
     if (attempt < MAX_RETRY) await sleep(60_000);
   }
 
-  // Hết MAX_RETRY lần
   await log('ERROR', 'AUTO', `Hết ${MAX_RETRY} lần — bỏ cuộc`);
   sendNotif('NHPOJ ❌ Điểm danh thất bại', `Đã thử ${MAX_RETRY} lần (2 tiếng).`);
   await logSignin(acc.username || '?', false, `Hết ${MAX_RETRY} lần retry`);
 }
 
-// ───────────────────────────────────────────────────────────────
-// [BG-18/21] Auto-trigger: không cần nhấn nút
-// Gọi khi startup và mỗi ALARM_POLL.
-// [BG-21] Dùng checkSigninStatus() mới trả về { needSignIn, reason } | null
-// ───────────────────────────────────────────────────────────────
+/**
+ * Kiểm tra nhanh và tự kích hoạt điểm danh nếu cần.
+ * Được gọi khi browser khởi động và sau mỗi chu kỳ poll.
+ * Không làm gì nếu đã điểm danh, autoSignin tắt, hoặc đang có luồng chờ.
+ */
 async function checkAndAutoSignInIfNeeded() {
   try {
     const { account } = await chrome.storage.local.get('account');
     if (!account?.autoSignin) return;
 
-    // Tránh chạy song song với runAutoSignIn đang pending
     const existingRun = await chrome.alarms.get(ALARM_SIGNIN_RUN);
     if (existingRun) {
       await log('DEBUG', 'AUTO_CHK', 'ALARM_SIGNIN_RUN đang chờ — không trigger thêm');
@@ -641,7 +652,6 @@ async function checkAndAutoSignInIfNeeded() {
       return;
     }
 
-    // needSignIn=true → kích hoạt sign-in ngay
     await log('INFO', 'AUTO_CHK', `⚡ Chưa điểm danh (effectiveDate="${statusResult.effectiveDate}") → auto sign-in ngay`);
     await runAutoSignIn();
   } catch (e) {
@@ -649,9 +659,15 @@ async function checkAndAutoSignInIfNeeded() {
   }
 }
 
-// ───────────────────────────────────────────────────────────────
-// Alarms
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Alarm Scheduling
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Lên lịch alarm điểm danh hàng ngày vào giờ chỉ định.
+ * Nếu giờ chỉ định đã qua trong ngày hiện tại, alarm sẽ kích hoạt vào ngày hôm sau.
+ * @param {string} timeStr - Chuỗi giờ dạng "HH:MM", ví dụ "07:30".
+ */
 async function scheduleSigninAlarm(timeStr) {
   const [h, m] = (timeStr || '00:01').split(':').map(Number);
   await chrome.alarms.clear(ALARM_SIGNIN);
@@ -662,15 +678,21 @@ async function scheduleSigninAlarm(timeStr) {
   await log('INFO', 'ALARM', `Lên lịch điểm danh lúc ${t.toLocaleTimeString('vi-VN')}`);
 }
 
+/**
+ * Khởi tạo alarm poll định kỳ mỗi `POLL_MINUTES` phút.
+ * Alarm cũ sẽ bị xoá trước khi tạo mới để tránh chồng chéo.
+ */
 async function schedulePollAlarm() {
   await chrome.alarms.clear(ALARM_POLL);
   chrome.alarms.create(ALARM_POLL, { periodInMinutes: POLL_MINUTES });
 }
 
-// [BG-11/14] CRITICAL FIX: Dùng chrome.alarms cho random delay thay vì setTimeout.
-// setTimeout trong SW không đáng tin — Chrome có thể kill SW trước khi timeout fires.
-// ALARM_SIGNIN → tạo ALARM_SIGNIN_RUN với delay ngẫu nhiên → runAutoSignIn()
-// [BG-18] ALARM_POLL → thêm checkAndAutoSignInIfNeeded() sau AuthManager.refresh()
+/**
+ * Xử lý các alarm được kích hoạt:
+ *  - `ALARM_SIGNIN`     → Tạo `ALARM_SIGNIN_RUN` với độ trễ ngẫu nhiên 1–20 phút.
+ *  - `ALARM_SIGNIN_RUN` → Thực thi `runAutoSignIn()`.
+ *  - `ALARM_POLL`       → Làm mới auth + kiểm tra điểm danh tự động.
+ */
 chrome.alarms.onAlarm.addListener(async ({ name }) => {
   if (name === ALARM_SIGNIN) {
     const delayMin = getRandomDelayMin();
@@ -683,14 +705,20 @@ chrome.alarms.onAlarm.addListener(async ({ name }) => {
   }
   if (name === ALARM_POLL) {
     await AuthManager.refresh();
-    // [BG-18] Sau mỗi lần poll (5 phút), kiểm tra tự động nếu chưa điểm danh
     await checkAndAutoSignInIfNeeded();
   }
 });
 
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Ghi một bản ghi lịch sử điểm danh vào `chrome.storage.local` (tối đa 100 bản ghi).
+ * @param {string}  username - Tên người dùng.
+ * @param {boolean} success  - `true` nếu điểm danh thành công.
+ * @param {string}  message  - Mô tả kết quả hoặc nguyên nhân thất bại.
+ */
 async function logSignin(username, success, message) {
   const { logs = [] } = await chrome.storage.local.get('logs');
   logs.unshift({ username, success, message, time: new Date().toLocaleString('vi-VN') });
@@ -698,15 +726,19 @@ async function logSignin(username, success, message) {
   await chrome.storage.local.set({ logs });
 }
 
+/**
+ * Hiển thị thông báo hệ thống (Chrome Notification API).
+ * @param {string} title   - Tiêu đề thông báo.
+ * @param {string} message - Nội dung thông báo.
+ */
 function sendNotif(title, message) {
   chrome.notifications.create({ type: 'basic', iconUrl: 'icons/icon48.png', title, message, priority: 1 });
 }
 
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Message Handler
-// [BG-9] FIX: thêm case 'DETECT_SESSION'
-// [BG-8] FIX: UPDATE_SETTINGS whitelist field
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+
 chrome.runtime.onMessage.addListener((m, _, sendResponse) => {
   handleMsg(m)
     .then(r  => { console.log('[MSG]', m.action, '→', r); sendResponse(r); })
@@ -714,6 +746,23 @@ chrome.runtime.onMessage.addListener((m, _, sendResponse) => {
   return true;
 });
 
+/**
+ * Điều phối các message từ popup hoặc content script.
+ *
+ * Các action được hỗ trợ:
+ *  - `GET_ACCOUNT`    — Lấy thông tin tài khoản từ cache hoặc storage.
+ *  - `DETECT_SESSION` — Kích hoạt refresh auth ngầm, trả lời ngay.
+ *  - `CHECK_STATUS`   — Kiểm tra trạng thái điểm danh, tự kích hoạt nếu cần.
+ *  - `SIGNIN_NOW`     — Điểm danh thủ công ngay lập tức.
+ *  - `UPDATE_SETTINGS`— Cập nhật signinTime / autoSignin (whitelist field).
+ *  - `GET_LOGS`       — Lấy lịch sử điểm danh.
+ *  - `GET_DEV_LOGS`   — Lấy debug logs.
+ *  - `CLEAR_LOGS`     — Xoá lịch sử điểm danh.
+ *  - `CLEAR_DEV_LOGS` — Xoá debug logs.
+ *
+ * @param {{action: string, payload?: object}} param0 - Message nhận được.
+ * @returns {Promise<object>} Kết quả trả về cho sender.
+ */
 async function handleMsg({ action, payload = {} }) {
   switch (action) {
 
@@ -726,11 +775,9 @@ async function handleMsg({ action, payload = {} }) {
       return { account: UserCache.get(), authState: UserCache.authState(), fromCache: false };
     }
 
-    // [BG-9] FIX: DETECT_SESSION — popup gửi khi không có cache
-    // Background refresh và sẽ broadcast AUTH_CHANGED nếu đăng nhập
     case 'DETECT_SESSION': {
       await log('INFO', 'MSG', 'DETECT_SESSION — trigger refresh');
-      AuthManager.refresh(); // không await — trả lời ngay, broadcast sẽ đến sau
+      AuthManager.refresh();
       return { queued: true };
     }
 
@@ -739,7 +786,6 @@ async function handleMsg({ action, payload = {} }) {
       const statusResult = await checkSigninStatus();
 
       if (statusResult === null) {
-        // null → lỗi mạng hoặc data=null → xác minh lại bằng /api/profile
         await log('WARN', 'AUTO', 'checkSigninStatus null → fallback fetchProfile để xác minh login');
         const { loggedIn } = await fetchProfile();
         if (!loggedIn) {
@@ -751,16 +797,14 @@ async function handleMsg({ action, payload = {} }) {
         return { status: 'error', error: 'Không lấy được trạng thái điểm danh — kiểm tra debug log.' };
       }
 
-      // [BG-21] Nếu chưa điểm danh + autoSignin bật → tự gửi POST ngầm
       if (statusResult.needSignIn) {
         const { account: accChk } = await chrome.storage.local.get('account');
         if (accChk?.autoSignin) {
           await log('INFO', 'AUTO', 'CHECK_STATUS: cần điểm danh + autoSignin → fire sign-in ngầm');
-          runAutoSignIn(); // không await — chạy nền
+          runAutoSignIn();
         }
       }
 
-      // Trả kết quả từ parseSigninResponse về popup
       return parseSigninResponse(await callSigninApi('GET'));
     }
 
@@ -792,7 +836,6 @@ async function handleMsg({ action, payload = {} }) {
     case 'UPDATE_SETTINGS': {
       const { account } = await chrome.storage.local.get('account');
       if (!account) return { success: false };
-      // [BG-8] FIX: chỉ cho phép sửa 2 field an toàn — không dùng Object.assign tự do
       const ALLOWED = ['signinTime', 'autoSignin'];
       for (const key of ALLOWED) {
         if (key in payload) account[key] = payload[key];
@@ -813,9 +856,15 @@ async function handleMsg({ action, payload = {} }) {
   }
 }
 
-// ───────────────────────────────────────────────────────────────
-// Startup — [BG-4] await schedulePollAlarm; [BG-10] tránh double refresh
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Startup
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Khởi tạo extension: warm cache, lên lịch poll alarm, refresh auth,
+ * khôi phục alarm điểm danh, và kiểm tra tự động nếu chưa điểm danh.
+ * @param {'installed/updated'|'browser-startup'} reason - Lý do khởi động.
+ */
 async function _startup(reason) {
   await log('INFO', 'INIT', `Khởi động (${reason})`);
   await AuthManager.warmFromStorage();
@@ -823,18 +872,14 @@ async function _startup(reason) {
   await AuthManager.refresh();
   const { account } = await chrome.storage.local.get('account');
   if (account?.autoSignin) await scheduleSigninAlarm(account.signinTime);
-
-  // [BG-18] Khi browser mở lại — nếu chưa điểm danh hôm nay + còn trước 7h → tự sign-in
   await checkAndAutoSignInIfNeeded();
 }
 
 chrome.runtime.onInstalled.addListener(() => _startup('installed/updated'));
 chrome.runtime.onStartup.addListener(()   => _startup('browser-startup'));
 
-// [BG-10] FIX: service worker wake — warm cache, chỉ refresh nếu thực sự stale
-// Tránh double fetchProfile khi vừa chạy qua onInstalled/onStartup
 AuthManager.warmFromStorage().then(() => {
   if (UserCache.isStale(30_000)) AuthManager.refresh();
 });
 
-log('INFO', 'INIT', 'Service worker v22 — [BG-21] logic ngày theo server +08:00 mốc 07:00, isSignedInToday(), bỏ deadline 7h trong retry');
+log('INFO', 'INIT', 'Service worker v22 — logic ngày theo server +08:00 mốc 07:00');
